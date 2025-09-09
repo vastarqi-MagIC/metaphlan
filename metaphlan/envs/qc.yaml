@@ -1,0 +1,14 @@
+name: mg-qc
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  # trimming
+  - fastp=0.23.*
+  # host removal tool + dependency stack
+  - kneaddata=0.12.*
+  - bowtie2>=2.5
+  - samtools>=1.17
+  - pigz
+  - python>=3.9

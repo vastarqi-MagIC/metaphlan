@@ -1,0 +1,425 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import pandas as pd
+from snakemake.utils import min_version
+min_version("7.0")
+
+configfile: "config/config.yaml"
+
+SAMPLES_TSV = config["samples"]
+WORKDIR = os.path.realpath(config.get("workdir", "."))
+os.makedirs("logs", exist_ok=True)
+os.makedirs("benchmark", exist_ok=True)
+
+def parse_samples(samples_tsv):
+    df = pd.read_csv(samples_tsv, sep="\t", dtype={"sample_id": str, "fq1": str, "fq2": str})
+    if not {"sample_id", "fq1", "fq2"}.issubset(df.columns):
+        print(f"ERROR: samples.tsv must contain columns: sample_id,fq1,fq2. Got: {df.columns.tolist()}")
+        sys.exit(2)
+    df = df.set_index("sample_id")
+    cancel = False
+    for sid in df.index.unique():
+        sid = str(sid)
+        if "." in sid:
+            print(f"Sample id '{sid}' contains '.', please remove dots.")
+            cancel = True
+        fq1_list = df.loc[[sid]]["fq1"].dropna().tolist()
+        fq2_list = df.loc[[sid]]["fq2"].dropna().tolist()
+        if len(fq1_list) == 0 or len(fq2_list) == 0:
+            print(f"{sid}: fq1/fq2 not provided")
+            cancel = True
+        for f in fq1_list + fq2_list:
+            if not f.endswith(".gz"):
+                print(f"{sid}: {f} should be gzipped (.gz)")
+                cancel = True
+            if not os.path.exists(f):
+                print(f"{sid}: file not found: {f}")
+                cancel = True
+    if cancel:
+        sys.exit(2)
+    return df
+
+SAMPLES = parse_samples(SAMPLES_TSV)
+SAMPLE_IDS = SAMPLES.index.unique().tolist()
+
+# Paths from config
+DBS = config["databases"]
+ENV = config["envs"]
+
+# Final targets
+rule all:
+    input:
+        # DB done flags
+        "results/db.metaphlan4.done",
+        "results/db.kneaddata_human.done",
+        "results/db.humann3.done",
+        "results/db.humann3.config.done",
+        # Per-sample analyses
+        expand("results/01.trimmed/{sample}/{sample}.trimmed.R1.fastq.gz", sample=SAMPLE_IDS),
+        expand("results/01.trimmed/{sample}/{sample}.trimmed.R2.fastq.gz", sample=SAMPLE_IDS),
+        expand("results/02.host_removed/{sample}/{sample}.host_removed.R1.fastq.gz", sample=SAMPLE_IDS),
+        expand("results/02.host_removed/{sample}/{sample}.host_removed.R2.fastq.gz", sample=SAMPLE_IDS),
+        expand("results/03.metaphlan4/profile/{sample}.metaphlan4.profile.tsv", sample=SAMPLE_IDS),
+        "results/03.metaphlan4/report/metaphlan4_merged_abundance.tsv",
+        expand("results/04.humann3/profile/{sample}/{sample}_{target}.tsv",
+               sample=SAMPLE_IDS, target=["genefamilies", "pathabundance", "pathcoverage"]),
+        expand("results/04.humann3/profile/{sample}/{sample}_{target}_cpm.tsv",
+               sample=SAMPLE_IDS, target=["genefamilies", "pathabundance", "pathcoverage"]),
+        expand("results/04.humann3/report/humann3_{target}_joined.tsv",
+               target=["genefamilies", "pathabundance", "pathcoverage"]),
+        expand("results/04.humann3/report/humann3_{target}_cpm_joined.tsv",
+               target=["genefamilies", "pathabundance", "pathcoverage"])
+
+################################################################################
+# Database downloads and configuration
+################################################################################
+
+rule db_metaphlan4:
+    output:
+        touch("results/db.metaphlan4.done")
+    log:
+        "logs/db.metaphlan4.install.log"
+    threads: config["metaphlan4"]["threads"]
+    conda:
+        ENV["metaphlan4"]
+    params:
+        bowtie2db=DBS["metaphlan"]["bowtie2_db"],
+        index=DBS["metaphlan"].get("index", "")
+    shell:
+        r'''
+        mkdir -p {params.bowtie2db}
+        if [ -n "{params.index}" ]; then
+            metaphlan --install --index {params.index} --bowtie2db {params.bowtie2db} > {log} 2>&1
+        else
+            metaphlan --install --bowtie2db {params.bowtie2db} > {log} 2>&1
+        fi
+        '''
+
+rule db_kneaddata_human:
+    output:
+        touch("results/db.kneaddata_human.done")
+    log:
+        "logs/db.kneaddata_human.install.log"
+    threads: 2
+    conda:
+        ENV["qc"]
+    params:
+        outdir=DBS["kneaddata"]["human_bowtie2_db"]
+    shell:
+        r'''
+        mkdir -p {params.outdir}
+        # Download prebuilt human Bowtie2 DB via KneadData
+        kneaddata_database --download human_genome bowtie2 {params.outdir} > {log} 2>&1
+        '''
+
+rule db_humann3:
+    output:
+        touch("results/db.humann3.done")
+    log:
+        "logs/db.humann3.install.log"
+    threads: config["humann"]["threads"]
+    conda:
+        ENV["humann3"]
+    params:
+        chocophlan=DBS["humann"]["chocophlan"],
+        uniref=DBS["humann"]["uniref"],
+        utility=DBS["humann"]["utility_mapping"],
+        uniref_flavor=DBS["humann"].get("uniref_flavor", "uniref90_diamond"),
+        chocophlan_level=DBS["humann"].get("chocophlan_level", "full")
+    shell:
+        r'''
+        mkdir -p {params.chocophlan} {params.uniref} {params.utility}
+        # Download utility mapping (needed for regrouping)
+        humann_databases --download utility_mapping full {params.utility} > {log} 2>&1
+        # Download ChocoPhlAn pangenomes
+        humann_databases --download chocophlan {params.chocophlan_level} {params.chocophlan} >> {log} 2>&1
+        # Download UniRef DB (DIAMOND flavor recommended)
+        humann_databases --download uniref {params.uniref_flavor} {params.uniref} >> {log} 2>&1
+        '''
+
+rule db_humann3_config:
+    input:
+        "results/db.humann3.done"
+    output:
+        touch("results/db.humann3.config.done")
+    log:
+        "logs/db.humann3.config.log"
+    conda:
+        ENV["humann3"]
+    params:
+        chocophlan=DBS["humann"]["chocophlan"],
+        uniref=DBS["humann"]["uniref"],
+        utility=DBS["humann"]["utility_mapping"],
+        threads=config["humann"]["threads"]
+    shell:
+        r'''
+        humann_config --update database_folders utility_mapping {params.utility} > {log} 2>&1
+        humann_config --update database_folders nucleotide {params.chocophlan} >> {log} 2>&1
+        humann_config --update database_folders protein {params.uniref} >> {log} 2>&1
+        humann_config --update run_modes threads {params.threads} >> {log} 2>&1
+        echo "---- CURRENT CONFIG ----" >> {log}
+        humann_config >> {log} 2>&1
+        '''
+
+################################################################################
+# Trimming (fastp)
+################################################################################
+
+rule trim_fastp:
+    input:
+        r1=lambda wc: SAMPLES.loc[wc.sample, "fq1"],
+        r2=lambda wc: SAMPLES.loc[wc.sample, "fq2"]
+    output:
+        r1="results/01.trimmed/{sample}/{sample}.trimmed.R1.fastq.gz",
+        r2="results/01.trimmed/{sample}/{sample}.trimmed.R2.fastq.gz",
+        html="results/01.trimmed/{sample}/{sample}.fastp.html",
+        json="results/01.trimmed/{sample}/{sample}.fastp.json"
+    threads: config["fastp"]["threads"]
+    resources:
+        mem_mb=config["fastp"].get("mem_mb", 8000),
+        time=config["fastp"].get("time", "02:00:00")
+    conda:
+        ENV["qc"]
+    log:
+        "logs/01.fastp/{sample}.fastp.log"
+    params:
+        extra=config["fastp"].get("opts", "")
+    shell:
+        r'''
+        mkdir -p $(dirname {output.r1})
+        fastp \
+          -i {input.r1} -I {input.r2} \
+          -o {output.r1} -O {output.r2} \
+          --thread {threads} \
+          --detect_adapter_for_pe \
+          --html {output.html} --json {output.json} \
+          {params.extra} \
+          > {log} 2>&1
+        '''
+
+################################################################################
+# Host removal (KneadData with human Bowtie2 DB)
+################################################################################
+
+rule rm_host_kneaddata:
+    input:
+        db="results/db.kneaddata_human.done",
+        r1="results/01.trimmed/{sample}/{sample}.trimmed.R1.fastq.gz",
+        r2="results/01.trimmed/{sample}/{sample}.trimmed.R2.fastq.gz"
+    output:
+        r1="results/02.host_removed/{sample}/{sample}.host_removed.R1.fastq.gz",
+        r2="results/02.host_removed/{sample}/{sample}.host_removed.R2.fastq.gz"
+    threads: config["kneaddata"]["threads"]
+    resources:
+        mem_mb=config["kneaddata"].get("mem_mb", 24000),
+        time=config["kneaddata"].get("time", "08:00:00")
+    conda:
+        ENV["qc"]
+    log:
+        "logs/02.kneaddata/{sample}.kneaddata.log"
+    params:
+        outdir="results/02.host_removed/{sample}",
+        prefix="{sample}",
+        bowtie2_db=DBS["kneaddata"]["human_bowtie2_db"],
+        bowtie2_opts=config["kneaddata"].get("bowtie2_opts", "--very-sensitive")
+    shell:
+        r'''
+        mkdir -p {params.outdir}
+        kneaddata \
+          -i {input.r1} -i {input.r2} \
+          --output {params.outdir} \
+          --output-prefix {params.prefix} \
+          --reference-db {params.bowtie2_db} \
+          --bowtie2-options "{params.bowtie2_opts}" \
+          --threads {threads} \
+          --bypass-trim \
+          --remove-intermediate-output \
+          --reorder \
+          --log {log} \
+          > {log} 2>&1
+
+        # Normalize filenames
+        mv {params.outdir}/{params.prefix}_paired_1.fastq {params.outdir}/{params.prefix}.host_removed.R1.fastq || true
+        mv {params.outdir}/{params.prefix}_paired_2.fastq {params.outdir}/{params.prefix}.host_removed.R2.fastq || true
+
+        # If outputs are not gz yet, compress
+        if [ -f "{params.outdir}/{params.prefix}.host_removed.R1.fastq" ]; then pigz -p {threads} {params.outdir}/{params.prefix}.host_removed.R1.fastq; fi
+        if [ -f "{params.outdir}/{params.prefix}.host_removed.R2.fastq" ]; then pigz -p {threads} {params.outdir}/{params.prefix}.host_removed.R2.fastq; fi
+
+        ln -sf $(realpath {params.outdir}/{params.prefix}.host_removed.R1.fastq.gz) {output.r1}
+        ln -sf $(realpath {params.outdir}/{params.prefix}.host_removed.R2.fastq.gz) {output.r2}
+        '''
+
+################################################################################
+# MetaPhlAn 4
+################################################################################
+
+rule metaphlan4_profile:
+    input:
+        db="results/db.metaphlan4.done",
+        r1="results/02.host_removed/{sample}/{sample}.host_removed.R1.fastq.gz",
+        r2="results/02.host_removed/{sample}/{sample}.host_removed.R2.fastq.gz"
+    output:
+        profile="results/03.metaphlan4/profile/{sample}.metaphlan4.profile.tsv"
+    threads: config["metaphlan4"]["threads"]
+    resources:
+        mem_mb=config["metaphlan4"].get("mem_mb", 16000),
+        time=config["metaphlan4"].get("time", "04:00:00")
+    conda:
+        ENV["metaphlan4"]
+    log:
+        "logs/03.metaphlan4/{sample}.metaphlan4.log"
+    params:
+        bowtie2_db=DBS["metaphlan"]["bowtie2_db"],
+        index=DBS["metaphlan"].get("index", ""),
+        sample_id="{sample}"
+    shell:
+        r'''
+        READS="{input.r1},{input.r2}"
+        IDX_OPT=""
+        if [ -n "{params.index}" ]; then
+          IDX_OPT="--index {params.index}"
+        fi
+        metaphlan \
+          $READS \
+          --input_type fastq \
+          --bowtie2db {params.bowtie2_db} $IDX_OPT \
+          --nproc {threads} \
+          --add_viruses \
+          --bowtie2out {output.profile}.bowtie2.bz2 \
+          --sample_id {params.sample_id} \
+          --unknown_estimation \
+          --output_file {output.profile} \
+          > {log} 2>&1
+        '''
+
+rule metaphlan4_merge:
+    input:
+        expand("results/03.metaphlan4/profile/{sample}.metaphlan4.profile.tsv", sample=SAMPLE_IDS)
+    output:
+        merged="results/03.metaphlan4/report/metaphlan4_merged_abundance.tsv"
+    threads: 2
+    conda:
+        ENV["metaphlan4"]
+    log:
+        "logs/03.metaphlan4/metaphlan4_merge.log"
+    shell:
+        r'''
+        mkdir -p $(dirname {output.merged})
+        merge_metaphlan_tables.py {input} > {output.merged} 2> {log}
+        '''
+
+################################################################################
+# HUMAnN 3
+################################################################################
+
+rule humann3_profile:
+    input:
+        config_done="results/db.humann3.config.done",
+        r1="results/02.host_removed/{sample}/{sample}.host_removed.R1.fastq.gz",
+        r2="results/02.host_removed/{sample}/{sample}.host_removed.R2.fastq.gz",
+        taxon="results/03.metaphlan4/profile/{sample}.metaphlan4.profile.tsv"
+    output:
+        genefamilies="results/04.humann3/profile/{sample}/{sample}_genefamilies.tsv",
+        pathabundance="results/04.humann3/profile/{sample}/{sample}_pathabundance.tsv",
+        pathcoverage="results/04.humann3/profile/{sample}/{sample}_pathcoverage.tsv"
+    threads: config["humann"]["threads"]
+    resources:
+        mem_mb=config["humann"].get("mem_mb", 64000),
+        time=config["humann"].get("time", "24:00:00")
+    conda:
+        ENV["humann3"]
+    log:
+        "logs/04.humann3/{sample}.humann3.log"
+    params:
+        outdir="results/04.humann3/profile/{sample}",
+        basename="{sample}"
+    shell:
+        r'''
+        mkdir -p {params.outdir}
+        cat {input.r1} {input.r2} > {params.outdir}/{params.basename}.combined.fq.gz
+
+        humann \
+          --threads {threads} \
+          --input {params.outdir}/{params.basename}.combined.fq.gz \
+          --input-format fastq.gz \
+          --taxonomic-profile {input.taxon} \
+          --output-basename {params.basename} \
+          --output {params.outdir} \
+          --o-log {log} \
+          --remove-temp-output \
+          > {log} 2>&1
+
+        rm -f {params.outdir}/{params.basename}.combined.fq.gz
+        '''
+
+rule humann3_renorm_cpm:
+    input:
+        genefamilies="results/04.humann3/profile/{sample}/{sample}_genefamilies.tsv",
+        pathabundance="results/04.humann3/profile/{sample}/{sample}_pathabundance.tsv",
+        pathcoverage="results/04.humann3/profile/{sample}/{sample}_pathcoverage.tsv"
+    output:
+        genefamilies_cpm="results/04.humann3/profile/{sample}/{sample}_genefamilies_cpm.tsv",
+        pathabundance_cpm="results/04.humann3/profile/{sample}/{sample}_pathabundance_cpm.tsv",
+        pathcoverage_cpm="results/04.humann3/profile/{sample}/{sample}_pathcoverage_cpm.tsv"
+    threads: 2
+    conda:
+        ENV["humann3"]
+    log:
+        "logs/04.humann3/{sample}.humann3.renorm.log"
+    shell:
+        r'''
+        humann_renorm_table --input {input.genefamilies}  --units cpm --output {output.genefamilies_cpm}  > {log} 2>&1
+        humann_renorm_table --input {input.pathabundance} --units cpm --output {output.pathabundance_cpm} >> {log} 2>&1
+        humann_renorm_table --input {input.pathcoverage}  --units cpm --output {output.pathcoverage_cpm}  >> {log} 2>&1
+        '''
+
+rule humann3_join_tables:
+    input:
+        expand("results/04.humann3/profile/{sample}/{sample}_genefamilies.tsv", sample=SAMPLE_IDS),
+        expand("results/04.humann3/profile/{sample}/{sample}_pathabundance.tsv", sample=SAMPLE_IDS),
+        expand("results/04.humann3/profile/{sample}/{sample}_pathcoverage.tsv", sample=SAMPLE_IDS)
+    output:
+        genefamilies="results/04.humann3/report/humann3_genefamilies_joined.tsv",
+        pathabundance="results/04.humann3/report/humann3_pathabundance_joined.tsv",
+        pathcoverage="results/04.humann3/report/humann3_pathcoverage_joined.tsv"
+    threads: 2
+    conda:
+        ENV["humann3"]
+    log:
+        "logs/04.humann3/humann3.join_tables.log"
+    params:
+        input_dir="results/04.humann3/profile"
+    shell:
+        r'''
+        mkdir -p $(dirname {output.genefamilies})
+        humann_join_tables --input {params.input_dir} --file_name genefamilies.tsv   --output {output.genefamilies}   --search-subdirectories > {log} 2>&1
+        humann_join_tables --input {params.input_dir} --file_name pathabundance.tsv  --output {output.pathabundance}  --search-subdirectories >> {log} 2>&1
+        humann_join_tables --input {params.input_dir} --file_name pathcoverage.tsv   --output {output.pathcoverage}   --search-subdirectories >> {log} 2>&1
+        '''
+
+rule humann3_join_tables_cpm:
+    input:
+        expand("results/04.humann3/profile/{sample}/{sample}_genefamilies_cpm.tsv", sample=SAMPLE_IDS),
+        expand("results/04.humann3/profile/{sample}/{sample}_pathabundance_cpm.tsv", sample=SAMPLE_IDS),
+        expand("results/04.humann3/profile/{sample}/{sample}_pathcoverage_cpm.tsv", sample=SAMPLE_IDS)
+    output:
+        genefamilies="results/04.humann3/report/humann3_genefamilies_cpm_joined.tsv",
+        pathabundance="results/04.humann3/report/humann3_pathabundance_cpm_joined.tsv",
+        pathcoverage="results/04.humann3/report/humann3_pathcoverage_cpm_joined.tsv"
+    threads: 2
+    conda:
+        ENV["humann3"]
+    log:
+        "logs/04.humann3/humann3.join_tables_cpm.log"
+    params:
+        input_dir="results/04.humann3/profile"
+    shell:
+        r'''
+        mkdir -p $(dirname {output.genefamilies})
+        humann_join_tables --input {params.input_dir} --file_name genefamilies_cpm.tsv  --output {output.genefamilies}  --search-subdirectories > {log} 2>&1
+        humann_join_tables --input {params.input_dir} --file_name pathabundance_cpm.tsv --output {output.pathabundance} --search-subdirectories >> {log} 2>&1
+        humann_join_tables --input {params.input_dir} --file_name pathcoverage_cpm.tsv  --output {output.pathcoverage}  --search-subdirectories >> {log} 2>&1
+        '''

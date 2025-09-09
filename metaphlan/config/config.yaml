@@ -1,0 +1,56 @@
+# Work directory (used only for absolute resolution if needed)
+workdir: "."
+
+# Input sample sheet
+samples: "config/samples.tsv"
+
+# Envs: conda YAML files
+envs:
+  snakemake: "envs/snakemake.yaml"
+  qc: "envs/qc.yaml"
+  metaphlan4: "envs/metaphlan4.yaml"
+  humann3: "envs/humann3.yaml"
+
+# Databases and locations
+databases:
+  # MetaPhlAn 4 DB
+  metaphlan:
+    bowtie2_db: "db/metaphlan4"
+    # Optional: pin an index; leave empty for latest default
+    index: ""  # e.g., "mpa_vOct22_CHOCOPhlAnSGB_202212"
+
+  # KneadData human Bowtie2 DB
+  kneaddata:
+    human_bowtie2_db: "db/kneaddata/human_genome"
+
+  # HUMAnN DBs
+  humann:
+    chocophlan: "db/humann/chocophlan"
+    uniref: "db/humann/uniref"
+    utility_mapping: "db/humann/utility_mapping"
+    # Options:
+    uniref_flavor: "uniref90_diamond"   # or "uniref50_diamond"
+    chocophlan_level: "full"            # or "demo" for small test
+
+# Tool parameters
+fastp:
+  threads: 8
+  mem_mb: 8000
+  time: "02:00:00"
+  opts: ""   # extra fastp options if needed
+
+kneaddata:
+  threads: 16
+  mem_mb: 24000
+  time: "08:00:00"
+  bowtie2_opts: "--very-sensitive"
+
+metaphlan4:
+  threads: 8
+  mem_mb: 16000
+  time: "04:00:00"
+
+humann:
+  threads: 16
+  mem_mb: 64000
+  time: "24:00:00"

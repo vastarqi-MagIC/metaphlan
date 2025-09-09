@@ -1,0 +1,31 @@
+__default__:
+  partition: "general"
+  qos: ""
+  time: "04:00:00"
+  mem: "8000"
+  cpus: 4
+  jobname: "smk-{rule}"
+  account: ""
+  mail_user: ""
+  mail_type: "END,FAIL"
+  extra_sbatch: ""
+
+trim_fastp:
+  time: "02:00:00"
+  mem: "8000"
+  cpus: 8
+
+rm_host_kneaddata:
+  time: "08:00:00"
+  mem: "24000"
+  cpus: 16
+
+metaphlan4_profile:
+  time: "04:00:00"
+  mem: "16000"
+  cpus: 8
+
+humann3_profile:
+  time: "24:00:00"
+  mem: "64000"
+  cpus: 16
